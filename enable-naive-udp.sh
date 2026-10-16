@@ -18,7 +18,17 @@ TARGET_OS="${TARGET_OS:-linux}"
 TARGET_ARCH="${TARGET_ARCH:-}"
 TARGET_ARM="${TARGET_ARM:-}"
 
-OLD_BACKUP="${CADDY_BIN}_old_$(date +%Y%m%d-%H%M%S)"
+CADDY_CONFIG="${CADDY_CONFIG:-/etc/caddy-naive/Caddyfile}"
+CADDY_ADAPTER="${CADDY_ADAPTER:-caddyfile}"
+
+BACKUP_SUFFIX="_old_$(date +%Y%m%d-%H%M%S)"
+OLD_BACKUP="${CADDY_BIN}${BACKUP_SUFFIX}"
+CONFIG_BACKUP="${CADDY_CONFIG}${BACKUP_SUFFIX}"
+# Конфиг, подготовленный для нового бинарника (пусто, если менять конфиг не нужно)
+NEW_CONFIG=""
+
+# Опции aUsernameWoW, которых нет в zedifen: там CONNECT-UDP и UoT работают всегда
+ZEDIFEN_UNSUPPORTED_OPTIONS='udp_uri_template|passthrough_uot'
 
 log() {
   echo -e "\033[0;32m[INFO]\033[0m $*"
@@ -38,7 +48,7 @@ usage() {
   echo "  awow     - github.com/aUsernameWoW/forwardproxy@naive"
   echo "  zedifen  - github.com/zedifen/forwardproxy@naive (Caddy с патчем sing-quic BBRv1)"
   echo ""
-  echo "Переменные окружения: FORWARDPROXY, TARGET_OS, TARGET_ARCH, TARGET_ARM, XCADDY, ZEDIFEN_BRANCH"
+  echo "Переменные окружения: FORWARDPROXY, CADDY_CONFIG, CADDY_ADAPTER, TARGET_OS, TARGET_ARCH, TARGET_ARM, XCADDY, ZEDIFEN_BRANCH"
 }
 
 choose_forwardproxy() {
@@ -240,6 +250,11 @@ check_requirements() {
     exit 1
   fi
 
+  if [[ ! -f "$CADDY_CONFIG" ]]; then
+    err "Не найден конфиг: $CADDY_CONFIG (укажи путь через CADDY_CONFIG=...)"
+    exit 1
+  fi
+
   if ! command -v systemctl >/dev/null 2>&1; then
     err "systemctl не найден"
     exit 1
@@ -305,6 +320,72 @@ build_caddy() {
   "$NEW_CADDY" version || true
 }
 
+ask_yes_no() {
+  local prompt="$1" answer
+
+  if ! { : </dev/tty; } 2>/dev/null; then
+    return 0
+  fi
+
+  while true; do
+    read -rp "$prompt [Y/n]: " answer </dev/tty
+    case "${answer:-y}" in
+      y|Y|yes|д|Д|да) return 0 ;;
+      n|N|no|н|Н|нет) return 1 ;;
+      *) warn "Введи y или n" ;;
+    esac
+  done
+}
+
+prepare_config() {
+  if [[ "$FORWARDPROXY" != "zedifen" ]]; then
+    return
+  fi
+
+  if ! grep -Eq "^[[:space:]]*(${ZEDIFEN_UNSUPPORTED_OPTIONS})([[:space:]]|$)" "$CADDY_CONFIG"; then
+    return
+  fi
+
+  warn "В $CADDY_CONFIG есть опции, которых нет в zedifen/forwardproxy:"
+  grep -En "^[[:space:]]*(${ZEDIFEN_UNSUPPORTED_OPTIONS})([[:space:]]|$)" "$CADDY_CONFIG" | sed 's/^/    /'
+  echo ""
+  echo "  В zedifen UDP включён всегда:"
+  echo "    - CONNECT-UDP работает только по шаблону /.well-known/masque/udp/{host}/{port}/"
+  echo "      (если udp_uri_template был другим, клиентам нужно перейти на этот путь)"
+  echo "    - UoT-адреса всегда обрабатываются локально, passthrough_uot в upstream не поддерживается"
+  echo ""
+
+  if ! ask_yes_no "Закомментировать эти строки (оригинал сохранится в backup)?"; then
+    err "Без правки конфига zedifen не запустится. Отредактируй $CADDY_CONFIG вручную и запусти скрипт снова"
+    exit 1
+  fi
+
+  # Временный файл рядом с оригиналом, чтобы относительные import работали так же
+  NEW_CONFIG="${CADDY_CONFIG}.new"
+  sed -E "s/^([[:space:]]*)((${ZEDIFEN_UNSUPPORTED_OPTIONS})([[:space:]]|$))/\1# \2/" "$CADDY_CONFIG" > "$NEW_CONFIG"
+
+  log "Подготовлен конфиг для zedifen: $NEW_CONFIG"
+}
+
+validate_new_caddy() {
+  local config="${NEW_CONFIG:-$CADDY_CONFIG}"
+
+  if [[ "$(env -u GOOS -u GOARCH -u GOARM go env GOARCH)" != "$GOARCH" || "$(uname -s | tr '[:upper:]' '[:lower:]')" != "$GOOS" ]]; then
+    warn "Бинарник собран под другую платформу (${GOOS}/${GOARCH}), проверка конфига пропущена"
+    return
+  fi
+
+  log "Проверяем конфиг новым бинарником: $config"
+
+  if ! "$NEW_CADDY" validate --config "$config" --adapter "$CADDY_ADAPTER"; then
+    err "Новый Caddy не принимает конфиг. Текущий сервис не тронут"
+    [[ -n "$NEW_CONFIG" ]] && rm -f "$NEW_CONFIG"
+    exit 1
+  fi
+
+  log "Конфиг валиден"
+}
+
 stop_current_caddy() {
   log "Останавливаем текущий сервис: $CADDY_SERVICE"
 
@@ -336,13 +417,44 @@ install_new_caddy() {
 
   log "Новый бинарник установлен: $CADDY_BIN"
   "$CADDY_BIN" version || true
+
+  if [[ -n "$NEW_CONFIG" ]]; then
+    cp -p "$CADDY_CONFIG" "$CONFIG_BACKUP"
+    log "Старый конфиг сохранён как: $CONFIG_BACKUP"
+    cat "$NEW_CONFIG" > "$CADDY_CONFIG"
+    rm -f "$NEW_CONFIG"
+    log "Конфиг обновлён: $CADDY_CONFIG"
+  fi
+}
+
+rollback() {
+  warn "Откатываем изменения"
+
+  systemctl stop "$CADDY_SERVICE" 2>/dev/null || true
+
+  mv "$CADDY_BIN" "${CADDY_BIN}.failed"
+  mv "$OLD_BACKUP" "$CADDY_BIN"
+  log "Старый бинарник восстановлен, неудачный сохранён как: ${CADDY_BIN}.failed"
+
+  if [[ -n "$NEW_CONFIG" && -f "$CONFIG_BACKUP" ]]; then
+    cat "$CONFIG_BACKUP" > "$CADDY_CONFIG"
+    log "Старый конфиг восстановлен из: $CONFIG_BACKUP"
+  fi
+
+  systemctl reset-failed "$CADDY_SERVICE" 2>/dev/null || true
+  if systemctl start "$CADDY_SERVICE" && sleep 2 && systemctl is-active --quiet "$CADDY_SERVICE"; then
+    log "$CADDY_SERVICE снова запущен со старым бинарником"
+  else
+    err "$CADDY_SERVICE не запустился и после отката, проверь: journalctl -u $CADDY_SERVICE -n 80 --no-pager"
+  fi
 }
 
 start_caddy() {
   log "Запускаем сервис: $CADDY_SERVICE"
 
   systemctl reset-failed "$CADDY_SERVICE" 2>/dev/null || true
-  systemctl start "$CADDY_SERVICE"
+  # Не даём set -e оборвать скрипт до отката
+  systemctl start "$CADDY_SERVICE" || true
 
   sleep 2
 
@@ -352,13 +464,9 @@ start_caddy() {
     err "$CADDY_SERVICE не запустился"
     echo ""
     echo "Последние логи:"
-    journalctl -u "$CADDY_SERVICE" -n 80 --no-pager || true
+    journalctl -u "$CADDY_SERVICE" -n 80 --no-pager -o cat || true
     echo ""
-    echo "Откатить старый бинарник можно так:"
-    echo "  systemctl stop $CADDY_SERVICE"
-    echo "  mv $CADDY_BIN ${CADDY_BIN}.failed"
-    echo "  mv $OLD_BACKUP $CADDY_BIN"
-    echo "  systemctl start $CADDY_SERVICE"
+    rollback
     exit 1
   fi
 }
@@ -392,6 +500,11 @@ verify() {
   echo ""
   log "Готово. Старый бинарник сохранён:"
   echo "  $OLD_BACKUP"
+
+  if [[ -f "$CONFIG_BACKUP" ]]; then
+    log "Старый конфиг сохранён:"
+    echo "  $CONFIG_BACKUP"
+  fi
 }
 
 main() {
@@ -400,6 +513,8 @@ main() {
   detect_platform
   check_requirements
   build_caddy
+  prepare_config
+  validate_new_caddy
   stop_current_caddy
   install_new_caddy
   start_caddy
