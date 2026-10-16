@@ -355,6 +355,14 @@ prepare_config() {
   echo "    - UoT-адреса всегда обрабатываются локально, passthrough_uot в upstream не поддерживается"
   echo ""
 
+  if grep -Eq "^[[:space:]]*upstream([[:space:]]|$)" "$CADDY_CONFIG"; then
+    warn "В конфиге задан upstream. С zedifen UDP будет работать иначе:"
+    echo "    - UoT пойдёт напрямую с IP этого сервера, в обход upstream"
+    echo "    - CONNECT-UDP (MASQUE) при заданном upstream отклоняется (501)"
+    echo "  TCP по-прежнему идёт через upstream. Если UDP обязательно должен идти через upstream, оставайся на aUsernameWoW"
+    echo ""
+  fi
+
   if ! ask_yes_no "Закомментировать эти строки (оригинал сохранится в backup)?"; then
     err "Без правки конфига zedifen не запустится. Отредактируй $CADDY_CONFIG вручную и запусти скрипт снова"
     exit 1
